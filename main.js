@@ -190,6 +190,7 @@ function render() {
         session,
         submitted: alreadySubmitted,
         onSubmit: async (selectedIndex) => {
+          // Avoid double-submit for the same question index
           if (myAnsweredIndex === session.current_question_index) return
 
           myAnswer = selectedIndex
