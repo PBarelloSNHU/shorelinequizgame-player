@@ -151,4 +151,43 @@ function handlePlayAgain() {
   renderJoin(app, { onJoin: handleJoin })
 }
 
+async function resyncSessionState() {
+  if (!sessionId) return
+
+  session = await api.fetchSession(sessionId)
+
+  if (session.status === 'lobby') {
+    scoreboard = []
+  } else if (session.status === 'reveal' || session.status === 'ended') {
+    scoreboard = await api.fetchScoreboard(sessionId)
+  }
+
+  await render()
+}
+
+function subscribe() {
+  channel = joinSessionChannel(sessionId, {
+    presenceKey: playerId,
+    presencePayload: { role: 'player' },
+    onChange: handleBroadcast,
+    onPresenceSync: () => {},
+    onSubscribed: resyncSessionState,
+    onError: () => resyncSessionState(),
+  })
+
+  expiryPoll = setInterval(() => {
+    if (session?.status === 'question_live') api.tryAdvanceIfExpired(sessionId)
+  }, 1000)
+}
+
+window.addEventListener('focus', () => {
+  resyncSessionState().catch(console.error)
+})
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    resyncSessionState().catch(console.error)
+  }
+})
+
 boot()
