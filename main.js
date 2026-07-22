@@ -15,12 +15,12 @@ let sessionId = localStorage.getItem('tq357_player_session_id')
 let playerId = localStorage.getItem('tq357_player_id')
 
 let session = null
-let scoreboard = []
-let rosterCount = 0
-let currentQuestion = null
-let revealedQuestion = null
 let myAnswer = null
 let myAnsweredIndex = null
+let scoreboard = []
+let currentQuestion = null
+let revealedQuestion = null
+let rosterCount = 0
 let channel = null
 let expiryPoll = null
 let resyncPromise = null
@@ -31,19 +31,16 @@ async function boot() {
   if (sessionId && playerId) {
     try {
       subscribe()
-      await resyncSessionState()
+      await resyncPlayerState()
       return
     } catch (err) {
-      console.warn('Failed to restore saved player session:', err)
-      clearPlayerSession()
+      console.error('[player] failed to restore session:', err)
+      clearPlayerState()
     }
   }
 
   const urlCode = new URL(window.location.href).searchParams.get('code') || ''
-  renderJoin(app, {
-    prefillCode: urlCode,
-    onJoin: handleJoin,
-  })
+  renderJoin(app, { prefillCode: urlCode, onJoin: handleJoin })
 }
 
 async function handleJoin({ code, name }) {
@@ -65,8 +62,9 @@ async function handleJoin({ code, name }) {
     localStorage.setItem('tq357_player_id', playerId)
 
     subscribe()
-    await resyncSessionState()
+    await resyncPlayerState()
   } catch (err) {
+    console.error('[player] join failed:', err)
     renderJoin(app, {
       prefillCode: code,
       onJoin: handleJoin,
@@ -76,14 +74,12 @@ async function handleJoin({ code, name }) {
 }
 
 function friendlyError(err) {
-  if (err?.message?.includes('session_not_found')) {
+  if (err.message?.includes('session_not_found')) {
     return 'That code was not found — double check with the host.'
   }
-
-  if (err?.message?.includes('session_full')) {
+  if (err.message?.includes('session_full')) {
     return 'This session is already full (30 players).'
   }
-
   return 'Something went wrong — try again.'
 }
 
@@ -98,44 +94,84 @@ function subscribe() {
   })
 
   if (!expiryPoll) {
-    expiryPoll = setInterval(() => {
-      if (session?.status === 'question_live') {
-        api.tryAdvanceIfExpired(sessionId).catch((err) => {
-          console.warn('tryAdvanceIfExpired failed:', err)
+    expiryPoll = setInterval(async () => {
+      if (session?.status !== 'question_live') return
+
+      try {
+        console.log('[player] tryAdvanceIfExpired tick', {
+          sessionId,
+          status: session.status,
+          current_question_index: session.current_question_index,
         })
+
+        await api.tryAdvanceIfExpired(sessionId)
+
+        const freshSession = await api.fetchSession(sessionId)
+        if (
+          freshSession.status !== session.status ||
+          freshSession.current_question_index !== session.current_question_index
+        ) {
+          session = freshSession
+          await resyncPlayerState()
+        }
+      } catch (err) {
+        console.warn('[player] expiry poll failed:', err)
       }
     }, 1000)
   }
 }
 
 async function handleBroadcast(payload) {
-  const table = payload.table
+  console.log(
+    '[player] broadcast received:',
+    payload?.table,
+    payload?.record?.status,
+    payload
+  )
+
+  const table = payload?.table
 
   if (table === 'quiz_sessions') {
     session = payload.record
-    await resyncSessionState()
+
+    try {
+      await resyncPlayerState()
+    } catch (err) {
+      console.error('[player] resync after quiz_sessions broadcast failed:', err)
+    }
     return
   }
+
+  if (!sessionId) return
 
   if (table === 'quiz_scores') {
-    scoreboard = await api.fetchScoreboard(sessionId)
-    render()
+    try {
+      scoreboard = await api.fetchScoreboard(sessionId)
+      render()
+    } catch (err) {
+      console.warn('[player] failed to refresh scoreboard:', err)
+    }
     return
   }
 
-  if (table === 'quiz_players') {
-    const roster = await api.fetchRoster(sessionId)
-    rosterCount = roster.length
-    render()
+  if (table === 'quiz_players' && session?.status === 'lobby') {
+    try {
+      const roster = await api.fetchRoster(sessionId)
+      rosterCount = roster.length
+      render()
+    } catch (err) {
+      console.warn('[player] failed to refresh roster:', err)
+    }
   }
 }
 
-async function resyncSessionState() {
+async function resyncPlayerState() {
   if (!sessionId) return
   if (resyncPromise) return resyncPromise
 
   resyncPromise = (async () => {
-    session = await api.fetchSession(sessionId)
+    const freshSession = await api.fetchSession(sessionId)
+    session = freshSession
 
     currentQuestion = null
     revealedQuestion = null
@@ -153,6 +189,14 @@ async function resyncSessionState() {
       scoreboard = await api.fetchScoreboard(sessionId)
     }
 
+    console.log('[player] resynced player state:', {
+      status: session.status,
+      rosterCount,
+      currentQuestionIndex: session.current_question_index,
+      scoreboardCount: scoreboard.length,
+      myAnsweredIndex,
+    })
+
     render()
   })()
 
@@ -166,18 +210,15 @@ async function resyncSessionState() {
 function render() {
   if (!session) {
     const urlCode = new URL(window.location.href).searchParams.get('code') || ''
-    renderJoin(app, {
-      prefillCode: urlCode,
-      onJoin: handleJoin,
-    })
+    renderJoin(app, { prefillCode: urlCode, onJoin: handleJoin })
     return
   }
 
+  console.log('[player] render status:', session.status)
+
   switch (session.status) {
     case 'lobby':
-      renderWaitingRoom(app, {
-        rosterCount,
-      })
+      renderWaitingRoom(app, { rosterCount })
       break
 
     case 'question_live': {
@@ -190,17 +231,19 @@ function render() {
         session,
         submitted: alreadySubmitted,
         onSubmit: async (selectedIndex) => {
-          // Avoid double-submit for the same question index
-          if (myAnsweredIndex === session.current_question_index) return
-
           myAnswer = selectedIndex
           myAnsweredIndex = session.current_question_index
+
           render()
 
           try {
-            await api.submitAnswer(sessionId, session.current_question_index, selectedIndex)
+            await api.submitAnswer(
+              sessionId,
+              session.current_question_index,
+              selectedIndex
+            )
           } catch (err) {
-            console.warn('answer rejected:', err?.message || err)
+            console.warn('[player] answer rejected:', err?.message || err)
           }
         },
       })
@@ -231,20 +274,18 @@ function render() {
       break
 
     default:
-      console.warn('Unknown player session status:', session.status)
+      console.warn('[player] unknown session status:', session.status)
   }
 }
 
 function handlePlayAgain() {
-  clearPlayerSession()
+  clearPlayerState()
+
   const urlCode = new URL(window.location.href).searchParams.get('code') || ''
-  renderJoin(app, {
-    prefillCode: urlCode,
-    onJoin: handleJoin,
-  })
+  renderJoin(app, { prefillCode: urlCode, onJoin: handleJoin })
 }
 
-function clearPlayerSession() {
+function clearPlayerState() {
   localStorage.removeItem('tq357_player_session_id')
   localStorage.removeItem('tq357_player_id')
 
@@ -261,27 +302,27 @@ function clearPlayerSession() {
   sessionId = null
   playerId = null
   session = null
-  scoreboard = []
-  rosterCount = 0
-  currentQuestion = null
-  revealedQuestion = null
   myAnswer = null
   myAnsweredIndex = null
+  scoreboard = []
+  currentQuestion = null
+  revealedQuestion = null
+  rosterCount = 0
   resyncPromise = null
 }
 
 window.addEventListener('focus', () => {
   if (sessionId) {
-    resyncSessionState().catch((err) => {
-      console.error('Player focus resync failed:', err)
+    resyncPlayerState().catch((err) => {
+      console.error('[player] focus resync failed:', err)
     })
   }
 })
 
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && sessionId) {
-    resyncSessionState().catch((err) => {
-      console.error('Player visibility resync failed:', err)
+    resyncPlayerState().catch((err) => {
+      console.error('[player] visibility resync failed:', err)
     })
   }
 })
