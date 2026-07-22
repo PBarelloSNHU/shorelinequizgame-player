@@ -1,14 +1,9 @@
 import { supabase } from './supabaseClient.js'
 
-// Identical listening pattern to the host app — see host-client's
-// realtimeChannel.js for the full explanation of why clients only ever
-// listen here and never call channel.send() themselves.
-export function joinSessionChannel(sessionId, { presenceKey, presencePayload, onChange, onPresenceSync }) {
-  // `private: true` is required for the channel to be subject to the
-  // Realtime Authorization RLS policies on realtime.messages (see
-  // supabase/migrations/0001_init.sql §7) — without it, RLS is skipped
-  // entirely and the broadcast-from-database triggers will never reach
-  // this client.
+export function joinSessionChannel(
+  sessionId,
+  { presenceKey, presencePayload, onChange, onPresenceSync, onSubscribed, onError }
+) {
   const channel = supabase.channel(`session:${sessionId}`, {
     config: { private: true, presence: { key: presenceKey } },
   })
@@ -21,8 +16,14 @@ export function joinSessionChannel(sessionId, { presenceKey, presencePayload, on
   })
 
   channel.subscribe(async (status) => {
-    if (status === 'SUBSCRIBED' && presencePayload) {
-      await channel.track(presencePayload)
+    if (status === 'SUBSCRIBED') {
+      if (presencePayload) await channel.track(presencePayload)
+      await onSubscribed?.()
+      return
+    }
+
+    if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+      onError?.(status)
     }
   })
 
