@@ -1,0 +1,8 @@
+[
+  { "prompt": "What is 3 + 4?", "choices": ["5", "6", "7", "8"], "correctIndex": 2, "topic": "single-digit-addition" },
+  { "prompt": "What is 9 - 5?", "choices": ["2", "3", "4", "5"], "correctIndex": 2, "topic": "single-digit-subtraction" },
+  { "prompt": "What is 6 + 2?", "choices": ["6", "7", "8", "9"], "correctIndex": 2, "topic": "single-digit-addition" },
+  { "prompt": "What is 10 - 4?", "choices": ["4", "5", "6", "7"], "correctIndex": 2, "topic": "single-digit-subtraction" },
+  { "prompt": "What is 5 + 5?", "choices": ["8", "9", "10", "11"], "correctIndex": 2, "topic": "single-digit-addition" },
+  { "prompt": "What is 7 - 3?", "choices": ["2", "3", "4", "5"], "correctIndex": 2, "topic": "single-digit-subtraction" }
+]
