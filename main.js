@@ -24,6 +24,7 @@ let rosterCount = 0
 let channel = null
 let expiryPoll = null
 let resyncPromise = null
+let resyncError = null // NEW: surface fetch failures instead of hanging
 
 async function boot() {
   await ensureAnonymousSession()
@@ -170,23 +171,37 @@ async function resyncPlayerState() {
   if (resyncPromise) return resyncPromise
 
   resyncPromise = (async () => {
+    resyncError = null
+
     const freshSession = await api.fetchSession(sessionId)
     session = freshSession
 
     currentQuestion = null
     revealedQuestion = null
 
-    if (session.status === 'lobby') {
-      const roster = await api.fetchRoster(sessionId)
-      rosterCount = roster.length
-      scoreboard = []
-    } else if (session.status === 'question_live') {
-      currentQuestion = await api.fetchCurrentQuestion(sessionId)
-    } else if (session.status === 'reveal') {
-      revealedQuestion = await api.fetchRevealedQuestion(sessionId)
-      scoreboard = await api.fetchScoreboard(sessionId)
-    } else if (session.status === 'ended') {
-      scoreboard = await api.fetchScoreboard(sessionId)
+    try {
+      if (session.status === 'lobby') {
+        const roster = await api.fetchRoster(sessionId)
+        rosterCount = roster.length
+        scoreboard = []
+      } else if (session.status === 'question_live') {
+        currentQuestion = await api.fetchCurrentQuestion(sessionId)
+        if (!currentQuestion) {
+          throw new Error('fetchCurrentQuestion returned no data')
+        }
+      } else if (session.status === 'reveal') {
+        revealedQuestion = await api.fetchRevealedQuestion(sessionId)
+        if (!revealedQuestion) {
+          throw new Error('fetchRevealedQuestion returned no data')
+        }
+        scoreboard = await api.fetchScoreboard(sessionId)
+      } else if (session.status === 'ended') {
+        scoreboard = await api.fetchScoreboard(sessionId)
+      }
+    } catch (err) {
+      // Surface the failure instead of leaving stale null data with a silent render no-op.
+      console.error('[player] failed to load state for status', session.status, err)
+      resyncError = err
     }
 
     console.log('[player] resynced player state:', {
@@ -195,6 +210,7 @@ async function resyncPlayerState() {
       currentQuestionIndex: session.current_question_index,
       scoreboardCount: scoreboard.length,
       myAnsweredIndex,
+      resyncError: resyncError?.message ?? null,
     })
 
     render()
@@ -207,6 +223,14 @@ async function resyncPlayerState() {
   }
 }
 
+function renderStatusMessage(message, { isError = false } = {}) {
+  app.innerHTML = `
+    <div class="player-status ${isError ? 'player-status--error' : ''}">
+      <p>${message}</p>
+    </div>
+  `
+}
+
 function render() {
   if (!session) {
     const urlCode = new URL(window.location.href).searchParams.get('code') || ''
@@ -214,7 +238,20 @@ function render() {
     return
   }
 
-  console.log('[player] render status:', session.status)
+  console.log('[player] render status:', session.status, {
+    hasCurrentQuestion: !!currentQuestion,
+    hasRevealedQuestion: !!revealedQuestion,
+    resyncError: resyncError?.message ?? null,
+  })
+
+  // Surface a real error instead of leaving the page frozen on a stale placeholder.
+  if (resyncError) {
+    renderStatusMessage(
+      'Having trouble loading this question. Retrying…',
+      { isError: true }
+    )
+    return
+  }
 
   switch (session.status) {
     case 'lobby':
@@ -222,7 +259,11 @@ function render() {
       break
 
     case 'question_live': {
-      if (!currentQuestion) return
+      // Loading state, NOT a silent no-op — keeps DOM in sync with reality.
+      if (!currentQuestion) {
+        renderStatusMessage('Loading question…')
+        return
+      }
 
       const alreadySubmitted = myAnsweredIndex === session.current_question_index
 
@@ -251,7 +292,13 @@ function render() {
     }
 
     case 'reveal': {
-      if (!revealedQuestion) return
+      // This is the branch most likely to have been silently stuck.
+      // A reveal with zero answers is still valid data — only show a
+      // loading message if the revealed question itself hasn't arrived yet.
+      if (!revealedQuestion) {
+        renderStatusMessage('Loading results…')
+        return
+      }
 
       const myAnswerForThisQuestion =
         myAnsweredIndex === session.current_question_index ? myAnswer : null
@@ -260,7 +307,7 @@ function render() {
         question: revealedQuestion,
         correctIndex: revealedQuestion.correct_index,
         myAnswer: myAnswerForThisQuestion,
-        scoreboard,
+        scoreboard, // may be [] — that's a valid empty state, not a loading state
       })
       break
     }
@@ -275,6 +322,7 @@ function render() {
 
     default:
       console.warn('[player] unknown session status:', session.status)
+      renderStatusMessage(`Unknown session status: ${session.status}`, { isError: true })
   }
 }
 
@@ -309,6 +357,7 @@ function clearPlayerState() {
   revealedQuestion = null
   rosterCount = 0
   resyncPromise = null
+  resyncError = null
 }
 
 window.addEventListener('focus', () => {
