@@ -1,216 +1,411 @@
-import { ensureAnonymousSession } from './supabaseClient.js'
+// main.js — Shoreline Quiz Game Player
 import * as api from './api.js'
 import { joinSessionChannel } from './realtimeChannel.js'
-import {
-  renderJoin,
-  renderWaitingRoom,
-  renderQuestionAnswer,
-  renderFeedback,
-  renderFinalScore,
-} from './views.js'
+import { ensureAnonymousSession, supabase } from './supabaseClient.js'
 
-const app = document.querySelector('#app')
+const state = {
+  isLoading: true,
+  loadError: null,
+  session: null,        // { status, currentQuestionIndex, timerSeconds, questionStartedAt }
+  playerId: null,
+  rosterCount: 0,
+  scoreboard: [],
+  currentQuestion: null,   // { order_index, prompt, choices, timer_seconds, question_started_at }
+  revealedQuestion: null,  // { order_index, prompt, choices, correct_index }
+  myAnsweredIndex: null,
+  myLastCorrect: null,
+}
 
-let sessionId = localStorage.getItem('tq357_player_session_id')
-let playerId = localStorage.getItem('tq357_player_id')
-
-let session = null
-let myAnswer = null
-let myAnsweredIndex = null
-let scoreboard = []
-let currentQuestion = null
-let revealedQuestion = null
-let rosterCount = 0
+const rootEl = document.getElementById('app')
 let channel = null
-let expiryPoll = null
 let resyncPromise = null
-let resyncError = null // NEW: surface fetch failures instead of hanging
+let pollTimer = null
+let resyncFailureCount = 0
+const MAX_RESYNC_FAILURES = 3
 
-async function boot() {
-  await ensureAnonymousSession()
+// ---------- Render ----------
 
-  if (sessionId && playerId) {
-    try {
-      subscribe()
-      await resyncPlayerState()
-      return
-    } catch (err) {
-      console.error('[player] failed to restore session:', err)
-      clearPlayerState()
-    }
-  }
-
-  const urlCode = new URL(window.location.href).searchParams.get('code') || ''
-  renderJoin(app, { prefillCode: urlCode, onJoin: handleJoin })
-}
-
-async function handleJoin({ code, name }) {
-  if (!code || !name) {
-    renderJoin(app, {
-      prefillCode: code,
-      onJoin: handleJoin,
-      error: 'Enter both a code and your name.',
-    })
-    return
-  }
-
-  try {
-    const result = await api.joinSession({ code, name })
-    sessionId = result.session_id
-    playerId = result.player_id
-
-    localStorage.setItem('tq357_player_session_id', sessionId)
-    localStorage.setItem('tq357_player_id', playerId)
-
-    subscribe()
-    await resyncPlayerState()
-  } catch (err) {
-    console.error('[player] join failed:', err)
-    renderJoin(app, {
-      prefillCode: code,
-      onJoin: handleJoin,
-      error: friendlyError(err),
-    })
-  }
-}
-
-function friendlyError(err) {
-  if (err.message?.includes('session_not_found')) {
-    return 'That code was not found — double check with the host.'
-  }
-  if (err.message?.includes('session_full')) {
-    return 'This session is already full (30 players).'
-  }
-  return 'Something went wrong — try again.'
-}
-
-function subscribe() {
-  if (!sessionId || !playerId || channel) return
-
-  channel = joinSessionChannel(sessionId, {
-    presenceKey: playerId,
-    presencePayload: { role: 'player' },
-    onChange: handleBroadcast,
-    onPresenceSync: () => {},
+function render() {
+  console.log('[player] render status:', state.session?.status ?? 'none', {
+    isLoading: state.isLoading,
+    hasCurrentQuestion: !!state.currentQuestion,
+    hasRevealedQuestion: !!state.revealedQuestion,
+    loadError: state.loadError,
   })
 
-  if (!expiryPoll) {
-    expiryPoll = setInterval(async () => {
-      if (session?.status !== 'question_live') return
+  if (state.isLoading) {
+    rootEl.innerHTML = renderLoading()
+    return
+  }
+  if (state.loadError) {
+    rootEl.innerHTML = renderError(state.loadError)
+    wireRetry()
+    return
+  }
+  if (!state.session) {
+    rootEl.innerHTML = renderJoinScreen()
+    wireJoin()
+    return
+  }
+
+  switch (state.session.status) {
+    case 'lobby':
+      rootEl.innerHTML = renderLobby()
+      break
+    case 'question_live':
+      rootEl.innerHTML = renderQuestion()
+      wireAnswerButtons()
+      break
+    case 'reveal':
+      rootEl.innerHTML = renderReveal()
+      break
+    case 'ended':
+      rootEl.innerHTML = renderScoreboard()
+      wireRejoin()
+      break
+    default:
+      rootEl.innerHTML = renderUnknownStatus(state.session.status)
+  }
+}
+
+function renderLoading() {
+  return `<div class="player-loading">Having trouble loading this question. Retrying…</div>`
+}
+
+function renderError(message) {
+  return `
+    <div class="player-error">
+      <p>${escapeHtml(message)}</p>
+      <button id="retry-btn">Retry</button>
+    </div>
+  `
+}
+
+function renderJoinScreen(prefillCode = '', errorMsg = '') {
+  const urlCode = new URL(window.location.href).searchParams.get('code') || prefillCode
+  return `
+    <div class="player-join">
+      <h1>Join Quiz</h1>
+      ${errorMsg ? `<p class="join-error">${escapeHtml(errorMsg)}</p>` : ''}
+      <label>Join code
+        <input id="join-code" type="text" maxlength="6" value="${escapeHtml(urlCode)}" placeholder="ABC123" />
+      </label>
+      <label>Your name
+        <input id="join-name" type="text" maxlength="24" placeholder="Enter your name" />
+      </label>
+      <button id="join-btn">Join</button>
+    </div>
+  `
+}
+
+function renderUnknownStatus(status) {
+  return `<div class="player-error">Unknown session status: ${escapeHtml(String(status))}</div>`
+}
+
+function renderLobby() {
+  return `
+    <section class="player-lobby">
+      <h1>Waiting for the host to start…</h1>
+      <p>${state.rosterCount} player(s) in the room</p>
+    </section>
+  `
+}
+
+function renderQuestion() {
+  const q = state.currentQuestion
+  if (!q) {
+    return `<div class="player-error">Question data is unavailable. <button id="retry-btn">Retry</button></div>`
+  }
+  const choices = Array.isArray(q.choices) ? q.choices : []
+  const submitted = state.myAnsweredIndex !== null
+
+  const choicesMarkup = choices
+    .map(
+      (choice, i) => `
+        <button class="choice-btn" data-index="${i}" ${submitted ? 'disabled' : ''}
+          ${state.myAnsweredIndex === i ? 'data-selected="true"' : ''}>
+          ${escapeHtml(String(choice))}
+        </button>
+      `
+    )
+    .join('')
+
+  return `
+    <section class="player-question">
+      <h1>Question ${(q.order_index ?? 0) + 1}</h1>
+      <p>${escapeHtml(q.prompt)}</p>
+      <div class="choices">${choicesMarkup}</div>
+      ${submitted ? '<p class="answer-locked">Answer locked in — waiting for others…</p>' : ''}
+    </section>
+  `
+}
+
+function renderReveal() {
+  const q = state.revealedQuestion
+  if (!q) {
+    return `<div class="player-error">Question data is unavailable. <button id="retry-btn">Retry</button></div>`
+  }
+  const choices = Array.isArray(q.choices) ? q.choices : []
+  const choicesMarkup = choices
+    .map((choice, i) => {
+      const isCorrect = i === q.correct_index
+      const isMine = i === state.myAnsweredIndex
+      return `
+        <div class="reveal-choice ${isCorrect ? 'correct' : ''} ${isMine ? 'mine' : ''}">
+          ${escapeHtml(String(choice))} ${isCorrect ? '✓' : ''} ${isMine && !isCorrect ? '(your answer)' : ''}
+        </div>
+      `
+    })
+    .join('')
+
+  const resultMarkup =
+    state.myAnsweredIndex === null
+      ? '<p>You did not answer this question.</p>'
+      : `<p>${state.myLastCorrect ? 'Correct!' : 'Incorrect.'}</p>`
+
+  return `
+    <section class="player-reveal">
+      <h1>Answer Revealed</h1>
+      <p>${escapeHtml(q.prompt)}</p>
+      <div class="reveal-choices">${choicesMarkup}</div>
+      ${resultMarkup}
+      <p>Waiting for the host to continue…</p>
+    </section>
+  `
+}
+
+function renderScoreboard() {
+  const sorted = [...state.scoreboard].sort((a, b) => b.total_score - a.total_score)
+  const myRank = sorted.findIndex((row) => row.player_id === state.playerId) + 1
+
+  const rows = sorted
+    .map(
+      (row, i) => `
+        <li class="${row.player_id === state.playerId ? 'me' : ''}">
+          ${i + 1}. ${escapeHtml(row.quiz_players?.display_name ?? 'Player')} —
+          ${row.total_score} pts (${row.correct_count} correct)
+        </li>
+      `
+    )
+    .join('')
+
+  return `
+    <section class="player-scoreboard">
+      <h1>Final Scoreboard</h1>
+      ${myRank > 0 ? `<p>You placed #${myRank} of ${sorted.length}</p>` : ''}
+      <ol>${rows || '<li>No scores recorded.</li>'}</ol>
+      <button id="rejoin-btn">Join Another Quiz</button>
+    </section>
+  `
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;')
+}
+
+// ---------- Event wiring ----------
+
+function wireRetry() {
+  document.getElementById('retry-btn')?.addEventListener('click', () => {
+    if (state.playerId && getSessionIdFromState()) {
+      resyncFailureCount = 0
+      resyncPlayerState()
+    } else {
+      clearPlayerState()
+      state.isLoading = false
+      state.loadError = null
+      render()
+    }
+  })
+}
+
+function wireJoin() {
+  document.getElementById('join-btn')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget
+    btn.disabled = true
+    const code = document.getElementById('join-code').value.trim()
+    const name = document.getElementById('join-name').value.trim()
+
+    if (!code || !name) {
+      rootEl.innerHTML = renderJoinScreen(code, 'Please enter both a join code and your name.')
+      wireJoin()
+      return
+    }
+
+    try {
+      await ensureAnonymousSession()
+      const result = await api.joinSession({ code, name })
+      savePlayerState({ sessionId: result.session_id, playerId: result.player_id })
+      state.playerId = result.player_id
+      await bootSession(result.session_id)
+    } catch (err) {
+      console.error('[player] failed to join session', err)
+      rootEl.innerHTML = renderJoinScreen(code, err.message ?? 'Unable to join. Check the code and try again.')
+      wireJoin()
+    } finally {
+      btn.disabled = false
+    }
+  })
+}
+
+function wireAnswerButtons() {
+  document.querySelectorAll('.choice-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      if (state.myAnsweredIndex !== null) return
+      const index = Number(btn.dataset.index)
+      const sessionId = getSessionIdFromState()
+      const orderIndex = state.currentQuestion?.order_index ?? state.session.currentQuestionIndex
+
+      document.querySelectorAll('.choice-btn').forEach((b) => (b.disabled = true))
+      state.myAnsweredIndex = index
+      render()
 
       try {
-        console.log('[player] tryAdvanceIfExpired tick', {
-          sessionId,
-          status: session.status,
-          current_question_index: session.current_question_index,
-        })
-
-        await api.tryAdvanceIfExpired(sessionId)
-
-        const freshSession = await api.fetchSession(sessionId)
-        if (
-          freshSession.status !== session.status ||
-          freshSession.current_question_index !== session.current_question_index
-        ) {
-          session = freshSession
-          await resyncPlayerState()
-        }
+        const isCorrect = await api.submitAnswer(sessionId, orderIndex, index)
+        state.myLastCorrect = isCorrect
       } catch (err) {
-        console.warn('[player] expiry poll failed:', err)
+        console.error('[player] failed to submit answer', err)
+        state.myAnsweredIndex = null
+        render()
       }
-    }, 1000)
+    })
+  })
+}
+
+function wireRejoin() {
+  document.getElementById('rejoin-btn')?.addEventListener('click', () => {
+    clearPlayerState()
+    if (channel) {
+      channel.unsubscribe()
+      channel = null
+    }
+    if (pollTimer) {
+      clearInterval(pollTimer)
+      pollTimer = null
+    }
+    state.isLoading = false
+    state.loadError = null
+    state.session = null
+    state.playerId = null
+    render()
+  })
+}
+
+// ---------- Local persisted state ----------
+
+function savePlayerState({ sessionId, playerId }) {
+  try {
+    localStorage.setItem('tq357_session_id', sessionId)
+    localStorage.setItem('tq357_player_id', playerId)
+  } catch (_) {
+    // localStorage may be unavailable in sandboxed contexts; state still
+    // works for the current tab session via in-memory variables.
   }
 }
 
-async function handleBroadcast(payload) {
-  console.log(
-    '[player] broadcast received:',
-    payload?.table,
-    payload?.record?.status,
-    payload
-  )
-
-  const table = payload?.table
-
-  if (table === 'quiz_sessions') {
-    session = payload.record
-
-    try {
-      await resyncPlayerState()
-    } catch (err) {
-      console.error('[player] resync after quiz_sessions broadcast failed:', err)
+function loadPlayerState() {
+  try {
+    return {
+      sessionId: localStorage.getItem('tq357_session_id'),
+      playerId: localStorage.getItem('tq357_player_id'),
     }
-    return
-  }
-
-  if (!sessionId) return
-
-  if (table === 'quiz_scores') {
-    try {
-      scoreboard = await api.fetchScoreboard(sessionId)
-      render()
-    } catch (err) {
-      console.warn('[player] failed to refresh scoreboard:', err)
-    }
-    return
-  }
-
-  if (table === 'quiz_players' && session?.status === 'lobby') {
-    try {
-      const roster = await api.fetchRoster(sessionId)
-      rosterCount = roster.length
-      render()
-    } catch (err) {
-      console.warn('[player] failed to refresh roster:', err)
-    }
+  } catch (_) {
+    return { sessionId: null, playerId: null }
   }
 }
+
+function clearPlayerState() {
+  try {
+    localStorage.removeItem('tq357_session_id')
+    localStorage.removeItem('tq357_player_id')
+  } catch (_) {
+    // no-op
+  }
+}
+
+function getSessionIdFromState() {
+  return loadPlayerState().sessionId
+}
+
+// ---------- Data resync ----------
 
 async function resyncPlayerState() {
+  const sessionId = getSessionIdFromState()
   if (!sessionId) return
   if (resyncPromise) return resyncPromise
 
   resyncPromise = (async () => {
-    resyncError = null
-
-    const freshSession = await api.fetchSession(sessionId)
-    session = freshSession
-
-    currentQuestion = null
-    revealedQuestion = null
-
     try {
-      if (session.status === 'lobby') {
-        const roster = await api.fetchRoster(sessionId)
-        rosterCount = roster.length
-        scoreboard = []
-      } else if (session.status === 'question_live') {
-        currentQuestion = await api.fetchCurrentQuestion(sessionId)
-        if (!currentQuestion) {
-          throw new Error('fetchCurrentQuestion returned no data')
-        }
-      } else if (session.status === 'reveal') {
-        revealedQuestion = await api.fetchRevealedQuestion(sessionId)
-        if (!revealedQuestion) {
-          throw new Error('fetchRevealedQuestion returned no data')
-        }
-        scoreboard = await api.fetchScoreboard(sessionId)
-      } else if (session.status === 'ended') {
-        scoreboard = await api.fetchScoreboard(sessionId)
+      const rawSession = await api.fetchSession(sessionId)
+
+      state.session = {
+        status: rawSession.status,
+        currentQuestionIndex: rawSession.current_question_index ?? 0,
+        timerSeconds: rawSession.timer_seconds,
+        questionStartedAt: rawSession.question_started_at,
       }
+
+      state.currentQuestion = null
+      state.revealedQuestion = null
+
+      if (rawSession.status === 'lobby') {
+        const roster = await api.fetchRoster(sessionId)
+        state.rosterCount = roster.length
+        state.myAnsweredIndex = null
+        state.myLastCorrect = null
+      } else if (rawSession.status === 'question_live') {
+        state.currentQuestion = await api.fetchCurrentQuestion(sessionId)
+        if (!state.currentQuestion) throw new Error('fetchCurrentQuestion returned no data')
+      } else if (rawSession.status === 'reveal') {
+        state.revealedQuestion = await api.fetchRevealedQuestion(sessionId)
+        if (!state.revealedQuestion) throw new Error('fetchRevealedQuestion returned no data')
+      } else if (rawSession.status === 'ended') {
+        state.scoreboard = await api.fetchScoreboard(sessionId)
+      }
+
+      state.isLoading = false
+      state.loadError = null
+      resyncFailureCount = 0
     } catch (err) {
-      // Surface the failure instead of leaving stale null data with a silent render no-op.
-      console.error('[player] failed to load state for status', session.status, err)
-      resyncError = err
+      console.error('[player] failed to load state for status', state.session?.status, err)
+      resyncFailureCount += 1
+
+      if (resyncFailureCount >= MAX_RESYNC_FAILURES) {
+        console.warn('[player] giving up on broken session, clearing local state')
+        clearPlayerState()
+        if (channel) {
+          channel.unsubscribe()
+          channel = null
+        }
+        if (pollTimer) {
+          clearInterval(pollTimer)
+          pollTimer = null
+        }
+        state.isLoading = false
+        state.loadError = null
+        state.session = null
+        state.playerId = null
+        rootEl.innerHTML = renderJoinScreen('', 'Your session ended or is no longer valid. Please rejoin with the code.')
+        wireJoin()
+        return
+      }
+
+      state.isLoading = false
+      state.loadError = null // keep showing last known view rather than a hard error, unless failures exceed threshold
     }
 
     console.log('[player] resynced player state:', {
-      status: session.status,
-      rosterCount,
-      currentQuestionIndex: session.current_question_index,
-      scoreboardCount: scoreboard.length,
-      myAnsweredIndex,
-      resyncError: resyncError?.message ?? null,
+      status: state.session?.status,
+      rosterCount: state.rosterCount,
+      currentQuestionIndex: state.session?.currentQuestionIndex,
+      scoreboardCount: state.scoreboard.length,
+      myAnsweredIndex: state.myAnsweredIndex,
+      resyncFailureCount,
     })
 
     render()
@@ -223,157 +418,76 @@ async function resyncPlayerState() {
   }
 }
 
-function renderStatusMessage(message, { isError = false } = {}) {
-  app.innerHTML = `
-    <div class="player-status ${isError ? 'player-status--error' : ''}">
-      <p>${message}</p>
-    </div>
-  `
-}
+// ---------- Boot ----------
 
-function render() {
-  if (!session) {
-    const urlCode = new URL(window.location.href).searchParams.get('code') || ''
-    renderJoin(app, { prefillCode: urlCode, onJoin: handleJoin })
-    return
-  }
-
-  console.log('[player] render status:', session.status, {
-    hasCurrentQuestion: !!currentQuestion,
-    hasRevealedQuestion: !!revealedQuestion,
-    resyncError: resyncError?.message ?? null,
-  })
-
-  // Surface a real error instead of leaving the page frozen on a stale placeholder.
-  if (resyncError) {
-    renderStatusMessage(
-      'Having trouble loading this question. Retrying…',
-      { isError: true }
-    )
-    return
-  }
-
-  switch (session.status) {
-    case 'lobby':
-      renderWaitingRoom(app, { rosterCount })
-      break
-
-    case 'question_live': {
-      // Loading state, NOT a silent no-op — keeps DOM in sync with reality.
-      if (!currentQuestion) {
-        renderStatusMessage('Loading question…')
-        return
-      }
-
-      const alreadySubmitted = myAnsweredIndex === session.current_question_index
-
-      renderQuestionAnswer(app, {
-        question: currentQuestion,
-        session,
-        submitted: alreadySubmitted,
-        onSubmit: async (selectedIndex) => {
-          myAnswer = selectedIndex
-          myAnsweredIndex = session.current_question_index
-
-          render()
-
-          try {
-            await api.submitAnswer(
-              sessionId,
-              session.current_question_index,
-              selectedIndex
-            )
-          } catch (err) {
-            console.warn('[player] answer rejected:', err?.message || err)
-          }
-        },
-      })
-      break
-    }
-
-    case 'reveal': {
-      // This is the branch most likely to have been silently stuck.
-      // A reveal with zero answers is still valid data — only show a
-      // loading message if the revealed question itself hasn't arrived yet.
-      if (!revealedQuestion) {
-        renderStatusMessage('Loading results…')
-        return
-      }
-
-      const myAnswerForThisQuestion =
-        myAnsweredIndex === session.current_question_index ? myAnswer : null
-
-      renderFeedback(app, {
-        question: revealedQuestion,
-        correctIndex: revealedQuestion.correct_index,
-        myAnswer: myAnswerForThisQuestion,
-        scoreboard, // may be [] — that's a valid empty state, not a loading state
-      })
-      break
-    }
-
-    case 'ended':
-      renderFinalScore(app, {
-        scoreboard,
-        myPlayerId: playerId,
-        onPlayAgain: handlePlayAgain,
-      })
-      break
-
-    default:
-      console.warn('[player] unknown session status:', session.status)
-      renderStatusMessage(`Unknown session status: ${session.status}`, { isError: true })
-  }
-}
-
-function handlePlayAgain() {
-  clearPlayerState()
-
-  const urlCode = new URL(window.location.href).searchParams.get('code') || ''
-  renderJoin(app, { prefillCode: urlCode, onJoin: handleJoin })
-}
-
-function clearPlayerState() {
-  localStorage.removeItem('tq357_player_session_id')
-  localStorage.removeItem('tq357_player_id')
+async function bootSession(sessionId) {
+  state.isLoading = true
+  state.loadError = null
+  render()
 
   if (channel) {
     channel.unsubscribe()
     channel = null
   }
-
-  if (expiryPoll) {
-    clearInterval(expiryPoll)
-    expiryPoll = null
+  if (pollTimer) {
+    clearInterval(pollTimer)
+    pollTimer = null
   }
 
-  sessionId = null
-  playerId = null
-  session = null
-  myAnswer = null
-  myAnsweredIndex = null
-  scoreboard = []
-  currentQuestion = null
-  revealedQuestion = null
-  rosterCount = 0
-  resyncPromise = null
-  resyncError = null
+  await resyncPlayerState()
+
+  channel = joinSessionChannel(sessionId, {
+    presenceKey: state.playerId ?? 'player',
+    presencePayload: { playerId: state.playerId },
+    onChange: () => {
+      // A new question means the previous answer no longer applies.
+      state.myAnsweredIndex = null
+      state.myLastCorrect = null
+      resyncPlayerState()
+    },
+    onPresenceSync: (presenceState) => {
+      state.rosterCount = Object.keys(presenceState).length || state.rosterCount
+      if (state.session?.status === 'lobby') render()
+    },
+  })
+
+  pollTimer = setInterval(() => {
+    api.tryAdvanceIfExpired(sessionId).catch(() => {})
+    resyncPlayerState()
+  }, 5000)
+
+  window.addEventListener('beforeunload', () => {
+    if (channel) channel.unsubscribe()
+    if (pollTimer) clearInterval(pollTimer)
+  })
 }
 
-window.addEventListener('focus', () => {
-  if (sessionId) {
-    resyncPlayerState().catch((err) => {
-      console.error('[player] focus resync failed:', err)
-    })
-  }
-})
+async function boot() {
+  const { sessionId, playerId } = loadPlayerState()
 
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && sessionId) {
-    resyncPlayerState().catch((err) => {
-      console.error('[player] visibility resync failed:', err)
-    })
+  if (!sessionId || !playerId) {
+    state.isLoading = false
+    state.loadError = null
+    state.session = null
+    render()
+    return
   }
-})
+
+  try {
+    await ensureAnonymousSession()
+    state.playerId = playerId
+    await bootSession(sessionId)
+  } catch (err) {
+    console.error('[player] failed to resume session', err)
+    clearPlayerState()
+    state.isLoading = false
+    state.loadError = null
+    state.session = null
+    state.playerId = null
+    render()
+  }
+}
 
 boot()
+
+export { render, state }
