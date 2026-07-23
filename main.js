@@ -22,6 +22,7 @@ let resyncPromise = null
 let pollTimer = null
 let timerInterval = null
 let resyncFailureCount = 0
+let lastSeenOrderIndex = null
 const MAX_RESYNC_FAILURES = 3
 
 // ---------- Render ----------
@@ -31,6 +32,7 @@ function render() {
     isLoading: state.isLoading,
     hasCurrentQuestion: !!state.currentQuestion,
     hasRevealedQuestion: !!state.revealedQuestion,
+    myAnsweredIndex: state.myAnsweredIndex,
     loadError: state.loadError,
   })
 
@@ -338,6 +340,7 @@ function wireRejoin() {
       pollTimer = null
     }
     stopTimer()
+    lastSeenOrderIndex = null
     state.isLoading = false
     state.loadError = null
     state.session = null
@@ -408,9 +411,21 @@ async function resyncPlayerState() {
         state.rosterCount = roster.length
         state.myAnsweredIndex = null
         state.myLastCorrect = null
+        lastSeenOrderIndex = null
       } else if (rawSession.status === 'question_live') {
         state.currentQuestion = await api.fetchCurrentQuestion(sessionId)
         if (!state.currentQuestion) throw new Error('fetchCurrentQuestion returned no data')
+
+        // Reset the answer lock whenever the underlying question has actually
+        // changed. This is based on the fetched data itself, not on which
+        // code path triggered the resync, so a missed broadcast or a plain
+        // poll tick can never leave a stale "locked in" state on a new question.
+        const orderIndex = state.currentQuestion.order_index
+        if (orderIndex !== lastSeenOrderIndex) {
+          state.myAnsweredIndex = null
+          state.myLastCorrect = null
+          lastSeenOrderIndex = orderIndex
+        }
       } else if (rawSession.status === 'reveal') {
         state.revealedQuestion = await api.fetchRevealedQuestion(sessionId)
         if (!state.revealedQuestion) throw new Error('fetchRevealedQuestion returned no data')
@@ -437,6 +452,7 @@ async function resyncPlayerState() {
           pollTimer = null
         }
         stopTimer()
+        lastSeenOrderIndex = null
         state.isLoading = false
         state.loadError = null
         state.session = null
@@ -456,6 +472,7 @@ async function resyncPlayerState() {
       currentQuestionIndex: state.session?.currentQuestionIndex,
       scoreboardCount: state.scoreboard.length,
       myAnsweredIndex: state.myAnsweredIndex,
+      lastSeenOrderIndex,
       resyncFailureCount,
     })
 
@@ -474,6 +491,7 @@ async function resyncPlayerState() {
 async function bootSession(sessionId) {
   state.isLoading = true
   state.loadError = null
+  lastSeenOrderIndex = null
   render()
 
   if (channel) {
@@ -492,9 +510,6 @@ async function bootSession(sessionId) {
     presenceKey: state.playerId ?? 'player',
     presencePayload: { playerId: state.playerId },
     onChange: () => {
-      // A new question means the previous answer no longer applies.
-      state.myAnsweredIndex = null
-      state.myLastCorrect = null
       resyncPlayerState()
     },
     onPresenceSync: (presenceState) => {
