@@ -1,7 +1,7 @@
 // main.js — Shoreline Quiz Game Player
 import * as api from './api.js'
 import { joinSessionChannel } from './realtimeChannel.js'
-import { ensureAnonymousSession, supabase } from './supabaseClient.js'
+import { ensureAnonymousSession } from './supabaseClient.js'
 
 const state = {
   isLoading: true,
@@ -20,6 +20,7 @@ const rootEl = document.getElementById('app')
 let channel = null
 let resyncPromise = null
 let pollTimer = null
+let timerInterval = null
 let resyncFailureCount = 0
 const MAX_RESYNC_FAILURES = 3
 
@@ -51,20 +52,25 @@ function render() {
   switch (state.session.status) {
     case 'lobby':
       rootEl.innerHTML = renderLobby()
+      stopTimer()
       break
     case 'question_live':
       rootEl.innerHTML = renderQuestion()
       wireAnswerButtons()
+      startTimer(state.currentQuestion)
       break
     case 'reveal':
       rootEl.innerHTML = renderReveal()
+      stopTimer()
       break
     case 'ended':
       rootEl.innerHTML = renderScoreboard()
       wireRejoin()
+      stopTimer()
       break
     default:
       rootEl.innerHTML = renderUnknownStatus(state.session.status)
+      stopTimer()
   }
 }
 
@@ -132,6 +138,7 @@ function renderQuestion() {
 
   return `
     <section class="player-question">
+      <div class="timer-display" id="player-timer">--</div>
       <h1>Question ${(q.order_index ?? 0) + 1}</h1>
       <p>${escapeHtml(q.prompt)}</p>
       <div class="choices">${choicesMarkup}</div>
@@ -208,6 +215,45 @@ function escapeHtml(value) {
     .replace(/'/g, '&#039;')
 }
 
+// ---------- Timer ----------
+
+function startTimer(question) {
+  stopTimer()
+  if (!question?.question_started_at || !question?.timer_seconds) return
+
+  const startedAt = new Date(question.question_started_at).getTime()
+  const totalMs = question.timer_seconds * 1000
+  const sessionId = getSessionIdFromState()
+
+  const tick = () => {
+    const el = document.getElementById('player-timer')
+    if (!el) {
+      stopTimer()
+      return
+    }
+    const remainingMs = Math.max(0, startedAt + totalMs - Date.now())
+    const remainingSec = Math.ceil(remainingMs / 1000)
+    el.textContent = `${remainingSec}s`
+    el.classList.toggle('timer-low', remainingSec <= 5)
+
+    if (remainingMs <= 0) {
+      stopTimer()
+      api.tryAdvanceIfExpired(sessionId).catch(() => {})
+      resyncPlayerState()
+    }
+  }
+
+  tick()
+  timerInterval = setInterval(tick, 250)
+}
+
+function stopTimer() {
+  if (timerInterval) {
+    clearInterval(timerInterval)
+    timerInterval = null
+  }
+}
+
 // ---------- Event wiring ----------
 
 function wireRetry() {
@@ -234,6 +280,7 @@ function wireJoin() {
     if (!code || !name) {
       rootEl.innerHTML = renderJoinScreen(code, 'Please enter both a join code and your name.')
       wireJoin()
+      btn.disabled = false
       return
     }
 
@@ -264,6 +311,7 @@ function wireAnswerButtons() {
       document.querySelectorAll('.choice-btn').forEach((b) => (b.disabled = true))
       state.myAnsweredIndex = index
       render()
+      startTimer(state.currentQuestion)
 
       try {
         const isCorrect = await api.submitAnswer(sessionId, orderIndex, index)
@@ -272,6 +320,7 @@ function wireAnswerButtons() {
         console.error('[player] failed to submit answer', err)
         state.myAnsweredIndex = null
         render()
+        startTimer(state.currentQuestion)
       }
     })
   })
@@ -288,6 +337,7 @@ function wireRejoin() {
       clearInterval(pollTimer)
       pollTimer = null
     }
+    stopTimer()
     state.isLoading = false
     state.loadError = null
     state.session = null
@@ -386,6 +436,7 @@ async function resyncPlayerState() {
           clearInterval(pollTimer)
           pollTimer = null
         }
+        stopTimer()
         state.isLoading = false
         state.loadError = null
         state.session = null
@@ -433,61 +484,11 @@ async function bootSession(sessionId) {
     clearInterval(pollTimer)
     pollTimer = null
   }
+  stopTimer()
 
   await resyncPlayerState()
 
   channel = joinSessionChannel(sessionId, {
     presenceKey: state.playerId ?? 'player',
     presencePayload: { playerId: state.playerId },
-    onChange: () => {
-      // A new question means the previous answer no longer applies.
-      state.myAnsweredIndex = null
-      state.myLastCorrect = null
-      resyncPlayerState()
-    },
-    onPresenceSync: (presenceState) => {
-      state.rosterCount = Object.keys(presenceState).length || state.rosterCount
-      if (state.session?.status === 'lobby') render()
-    },
-  })
-
-  pollTimer = setInterval(() => {
-    api.tryAdvanceIfExpired(sessionId).catch(() => {})
-    resyncPlayerState()
-  }, 5000)
-
-  window.addEventListener('beforeunload', () => {
-    if (channel) channel.unsubscribe()
-    if (pollTimer) clearInterval(pollTimer)
-  })
-}
-
-async function boot() {
-  const { sessionId, playerId } = loadPlayerState()
-
-  if (!sessionId || !playerId) {
-    state.isLoading = false
-    state.loadError = null
-    state.session = null
-    render()
-    return
-  }
-
-  try {
-    await ensureAnonymousSession()
-    state.playerId = playerId
-    await bootSession(sessionId)
-  } catch (err) {
-    console.error('[player] failed to resume session', err)
-    clearPlayerState()
-    state.isLoading = false
-    state.loadError = null
-    state.session = null
-    state.playerId = null
-    render()
-  }
-}
-
-boot()
-
-export { render, state }
+    onChange: 
