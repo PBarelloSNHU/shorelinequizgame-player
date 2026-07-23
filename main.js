@@ -491,4 +491,56 @@ async function bootSession(sessionId) {
   channel = joinSessionChannel(sessionId, {
     presenceKey: state.playerId ?? 'player',
     presencePayload: { playerId: state.playerId },
-    onChange: 
+    onChange: () => {
+      // A new question means the previous answer no longer applies.
+      state.myAnsweredIndex = null
+      state.myLastCorrect = null
+      resyncPlayerState()
+    },
+    onPresenceSync: (presenceState) => {
+      state.rosterCount = Object.keys(presenceState).length || state.rosterCount
+      if (state.session?.status === 'lobby') render()
+    },
+  })
+
+  pollTimer = setInterval(() => {
+    api.tryAdvanceIfExpired(sessionId).catch(() => {})
+    resyncPlayerState()
+  }, 5000)
+
+  window.addEventListener('beforeunload', () => {
+    if (channel) channel.unsubscribe()
+    if (pollTimer) clearInterval(pollTimer)
+    stopTimer()
+  })
+}
+
+async function boot() {
+  const { sessionId, playerId } = loadPlayerState()
+
+  if (!sessionId || !playerId) {
+    state.isLoading = false
+    state.loadError = null
+    state.session = null
+    render()
+    return
+  }
+
+  try {
+    await ensureAnonymousSession()
+    state.playerId = playerId
+    await bootSession(sessionId)
+  } catch (err) {
+    console.error('[player] failed to resume session', err)
+    clearPlayerState()
+    state.isLoading = false
+    state.loadError = null
+    state.session = null
+    state.playerId = null
+    render()
+  }
+}
+
+boot()
+
+export { render, state }
