@@ -188,21 +188,22 @@ function renderScoreboard() {
   const myRank = sorted.findIndex((row) => row.player_id === state.playerId) + 1
 
   const rows = sorted
-    .map(
-      (row, i) => `
-        <li class="${row.player_id === state.playerId ? 'me' : ''}">
-          ${i + 1}. ${escapeHtml(row.quiz_players?.display_name ?? 'Player')} —
-          ${row.total_score} pts (${row.correct_count} correct)
+    .map((row, i) => {
+      const name = escapeHtml(row.quiz_players?.display_name ?? 'Player')
+      const isMe = row.player_id === state.playerId
+      return `
+        <li class="${isMe ? 'me' : ''}">
+          ${i + 1}. ${name} — ${row.total_score} pts (${row.correct_count} correct)
         </li>
       `
-    )
+    })
     .join('')
 
   return `
     <section class="player-scoreboard">
       <h1>Final Scoreboard</h1>
       ${myRank > 0 ? `<p>You placed #${myRank} of ${sorted.length}</p>` : ''}
-      <ol>${rows || '<li>No scores recorded.</li>'}</ol>
+      <ul class="scoreboard-list">${rows || '<li>No scores recorded.</li>'}</ul>
       <button id="rejoin-btn">Join Another Quiz</button>
     </section>
   `
@@ -417,9 +418,9 @@ async function resyncPlayerState() {
         if (!state.currentQuestion) throw new Error('fetchCurrentQuestion returned no data')
 
         // Reset the answer lock whenever the underlying question has actually
-        // changed. This is based on the fetched data itself, not on which
-        // code path triggered the resync, so a missed broadcast or a plain
-        // poll tick can never leave a stale "locked in" state on a new question.
+        // changed. This is based on fetched data, not on which code path
+        // triggered the resync, so a missed broadcast or a plain poll tick
+        // can never leave a stale "locked in" state on a new question.
         const orderIndex = state.currentQuestion.order_index
         if (orderIndex !== lastSeenOrderIndex) {
           state.myAnsweredIndex = null
